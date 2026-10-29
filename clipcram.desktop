@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ClipCram
+GenericName=Video Compressor
+Comment=Trim and squeeze videos under Discord's upload limit
+Exec=clipcram %F
+Icon=clipcram
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=video/mp4;video/x-matroska;video/quicktime;video/x-msvideo;video/webm;video/x-m4v;video/mp2t;video/x-flv;video/x-ms-wmv;video/3gpp;video/mpeg;video/ogg;
+Keywords=discord;compress;compressor;trim;clip;video;encode;
+StartupWMClass=clipcram

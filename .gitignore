@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+ 
+# Benchmark clips and logs created by bench/bench.sh
+/bench/*.mkv
+/bench/*.log
+ 
+# makepkg work folder, built packages and logs
+/.makepkg/
+/*.pkg.tar.*
+/*.log
+ 
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+ 
