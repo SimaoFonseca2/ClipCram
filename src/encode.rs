@@ -1,6 +1,7 @@
 //! Everything about turning one queue item into a file under the size limit:
 //! settings, resolution/frame-rate planning, FFmpeg arguments, and the worker thread.
 
+use crate::edit::{self, AudioLayout, AudioPlan, Edit, GraphSpec};
 use crate::ffmpeg::{self, Av1Encoder, Caps, GpuEncoder, HdrInfo, MediaInfo, Tools, NULL_DEVICE};
 use crate::util;
 use serde::{Deserialize, Serialize};
@@ -42,28 +43,117 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn vendor(self) -> &'static str {
+    /// The only vendor whose GPUs this backend drives. VA-API works with several, so its
+    /// vendor comes from the device instead.
+    pub fn native_vendor(self) -> Vendor {
         match self {
-            Backend::Software => "CPU",
-            Backend::Nvenc => "NVIDIA",
-            Backend::Qsv => "Intel",
-            Backend::Vaapi => "VA-API",
-            Backend::Amf => "AMD",
-            Backend::VideoToolbox => "Apple",
+            Backend::Software => Vendor::None,
+            Backend::Nvenc => Vendor::Nvidia,
+            Backend::Amf => Vendor::Amd,
+            Backend::Qsv => Vendor::Intel,
+            Backend::VideoToolbox => Vendor::Apple,
+            Backend::Vaapi => Vendor::Other,
         }
     }
+
+    pub fn api_name(self) -> &'static str {
+        match self {
+            Backend::Software => "CPU",
+            Backend::Nvenc => "NVENC",
+            Backend::Amf => "AMF",
+            Backend::Qsv => "Quick Sync",
+            Backend::Vaapi => "VA-API",
+            Backend::VideoToolbox => "VideoToolbox",
+        }
+    }
+}
+
+/// Who made the GPU a codec runs on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Vendor {
+    /// Not a GPU (CPU encoders).
+    #[default]
+    None,
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Other,
+}
+
+impl Vendor {
+    /// From a PCI vendor ID, as Linux reports it in sysfs.
+    pub fn from_pci_id(id: u16) -> Vendor {
+        match id {
+            0x10de => Vendor::Nvidia,
+            0x1002 | 0x1022 => Vendor::Amd,
+            0x8086 => Vendor::Intel,
+            _ => Vendor::Other,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Vendor::None => "CPU",
+            Vendor::Nvidia => "NVIDIA",
+            Vendor::Amd => "AMD",
+            Vendor::Intel => "Intel",
+            Vendor::Apple => "Apple",
+            Vendor::Other => "Other",
+        }
+    }
+}
+
+/// Where an encode runs: the CPU, or one particular GPU through one particular API.
+/// Two GPUs from the same vendor (say an AMD integrated and an AMD discrete card) are told
+/// apart by `slot`, the number of their Linux render node (renderD128 is slot 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Engine {
+    pub backend: Backend,
+    pub vendor: Vendor,
+    pub slot: u8,
+}
+
+impl Engine {
+    pub const CPU: Engine = Engine { backend: Backend::Software, vendor: Vendor::None, slot: 0 };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Codec {
     pub family: Family,
     pub backend: Backend,
+    /// Missing from settings saved by older versions; `normalized` fills it in.
+    #[serde(default)]
+    pub vendor: Vendor,
+    #[serde(default)]
+    pub slot: u8,
 }
 
 impl Codec {
-    pub const H265: Codec = Codec { family: Family::H265, backend: Backend::Software };
-    pub const H264: Codec = Codec { family: Family::H264, backend: Backend::Software };
-    pub const AV1: Codec = Codec { family: Family::Av1, backend: Backend::Software };
+    pub const H265: Codec = Codec::cpu(Family::H265);
+    pub const H264: Codec = Codec::cpu(Family::H264);
+    pub const AV1: Codec = Codec::cpu(Family::Av1);
+
+    pub const fn cpu(family: Family) -> Codec {
+        Codec { family, backend: Backend::Software, vendor: Vendor::None, slot: 0 }
+    }
+
+    pub const fn on(engine: Engine, family: Family) -> Codec {
+        Codec { family, backend: engine.backend, vendor: engine.vendor, slot: engine.slot }
+    }
+
+    pub fn engine(self) -> Engine {
+        Engine { backend: self.backend, vendor: self.vendor, slot: self.slot }
+    }
+
+    /// Fills in the vendor for backends that only have one, so codecs saved by versions that
+    /// didn't record it still match the ones detected now.
+    pub fn normalized(self) -> Codec {
+        match self.backend {
+            Backend::Vaapi => self,
+            b => Codec { vendor: b.native_vendor(), slot: 0, ..self },
+        }
+    }
 
     pub fn is_gpu(self) -> bool {
         self.backend != Backend::Software
@@ -80,8 +170,8 @@ impl Codec {
     pub fn label(self) -> String {
         match self.backend {
             Backend::Software => self.family_label().to_string(),
-            Backend::Vaapi => format!("{} on GPU via VA-API (fast)", self.family_label()),
-            b => format!("{} on {} GPU (fast)", self.family_label(), b.vendor()),
+            Backend::Vaapi => format!("{} on {} GPU via VA-API", self.family_label(), self.vendor.label()),
+            b => format!("{} on {} GPU", self.family_label(), b.native_vendor().label()),
         }
     }
 
@@ -92,13 +182,13 @@ impl Codec {
             Family::Av1 => "AV1",
         };
         if self.is_gpu() {
-            format!("{name} GPU")
+            let vendor = if self.backend == Backend::Vaapi { self.vendor } else { self.backend.native_vendor() };
+            format!("{name} {}", vendor.label())
         } else {
             name.to_string()
         }
     }
 
-    /// Suffix added to output filenames, e.g. `clip_discord_h265.mp4`.
     pub fn file_suffix(self) -> &'static str {
         match self.family {
             Family::H265 => "_discord_h265.mp4",
@@ -109,11 +199,94 @@ impl Codec {
 }
 
 pub fn default_output_name(input: &Path, codec: Codec) -> String {
-    let stem = input
+    format!("{}{}", file_stem(input), codec.file_suffix())
+}
+
+fn file_stem(input: &Path) -> String {
+    input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "video".to_string());
-    format!("{stem}{}", codec.file_suffix())
+        .unwrap_or_else(|| "video".to_string())
+}
+
+/// The automatic file name for these settings: `clip_discord_h265.mp4`, `clip_discord.gif`.
+pub fn output_name_for(input: &Path, settings: &EncodeSettings) -> String {
+    match settings.format {
+        OutputFormat::Mp4 => default_output_name(input, settings.codec),
+        f => format!("{}_discord.{}", file_stem(input), f.ext()),
+    }
+}
+
+/// Swaps the extension of a file name for the one the format needs.
+pub fn with_format_extension(name: &str, format: OutputFormat) -> String {
+    let path = Path::new(name);
+    let has_known = path
+        .extension()
+        .map(|e| ["mp4", "gif", "webp"].contains(&e.to_string_lossy().to_lowercase().as_str()))
+        .unwrap_or(false);
+    let stem = if has_known { path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() } else { name.to_string() };
+    format!("{stem}.{}", format.ext())
+}
+
+/// What kind of file comes out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputFormat {
+    #[default]
+    Mp4,
+    /// Animated GIF: plays everywhere, no sound, large per second of video.
+    Gif,
+    /// Animated WebP: much smaller than GIF, no sound.
+    Webp,
+}
+
+impl OutputFormat {
+    pub const ALL: [OutputFormat; 3] = [OutputFormat::Mp4, OutputFormat::Gif, OutputFormat::Webp];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputFormat::Mp4 => "MP4 video",
+            OutputFormat::Gif => "GIF (no sound)",
+            OutputFormat::Webp => "Animated WebP (no sound)",
+        }
+    }
+
+    pub fn ext(self) -> &'static str {
+        match self {
+            OutputFormat::Mp4 => "mp4",
+            OutputFormat::Gif => "gif",
+            OutputFormat::Webp => "webp",
+        }
+    }
+}
+
+/// Light noise removal before encoding. Grain and sensor noise eat bitrate; removing
+/// some of it leaves more for the picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Denoise {
+    #[default]
+    Off,
+    Light,
+    Strong,
+}
+
+impl Denoise {
+    pub const ALL: [Denoise; 3] = [Denoise::Off, Denoise::Light, Denoise::Strong];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Denoise::Off => "Off",
+            Denoise::Light => "Light",
+            Denoise::Strong => "Strong",
+        }
+    }
+
+    fn filter(self) -> Option<&'static str> {
+        match self {
+            Denoise::Off => None,
+            Denoise::Light => Some("hqdn3d=2:1.5:3:2.25"),
+            Denoise::Strong => Some("hqdn3d=4:3:6:4.5"),
+        }
+    }
 }
 
 // ============================================================
@@ -249,14 +422,16 @@ pub enum SizePreset {
     Discord10,
     Nitro50,
     Nitro500,
+    Email,
     Custom,
 }
 
 impl SizePreset {
-    pub const ALL: [SizePreset; 4] = [
+    pub const ALL: [SizePreset; 5] = [
         SizePreset::Discord10,
         SizePreset::Nitro50,
         SizePreset::Nitro500,
+        SizePreset::Email,
         SizePreset::Custom,
     ];
 
@@ -265,6 +440,7 @@ impl SizePreset {
             SizePreset::Discord10 => "10 MB (free)",
             SizePreset::Nitro50 => "50 MB (Nitro Basic)",
             SizePreset::Nitro500 => "500 MB (Nitro)",
+            SizePreset::Email => "Email (25 MB attachment limit)",
             SizePreset::Custom => "Custom",
         }
     }
@@ -275,12 +451,18 @@ impl SizePreset {
             SizePreset::Discord10 => 9.5,
             SizePreset::Nitro50 => 47.5,
             SizePreset::Nitro500 => 475.0,
+            // Mail clients send attachments base64-encoded, which adds about a third, so a
+            // 25 MB limit fits a file of about 18 MB.
+            SizePreset::Email => 17.0,
             SizePreset::Custom => custom.max(0.5),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Saved between runs as the settings new videos start with. `serde(default)` fills in any
+/// field missing from an older settings file, so adding a field never resets the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EncodeSettings {
     pub codec: Codec,
     pub resolution: ResolutionMode,
@@ -289,6 +471,10 @@ pub struct EncodeSettings {
     pub audio: AudioMode,
     pub tracks: TrackMode,
     pub hdr_to_sdr: bool,
+    pub format: OutputFormat,
+    pub denoise: Denoise,
+    /// Even out loudness to -16 LUFS, the usual level for online video.
+    pub normalize: bool,
 }
 
 impl EncodeSettings {
@@ -301,7 +487,16 @@ impl EncodeSettings {
             audio: AudioMode::Aac96,
             tracks: TrackMode::Mix,
             hdr_to_sdr: true,
+            format: OutputFormat::Mp4,
+            denoise: Denoise::Off,
+            normalize: false,
         }
+    }
+}
+
+impl Default for EncodeSettings {
+    fn default() -> Self {
+        EncodeSettings::new(Codec::H265)
     }
 }
 
@@ -398,6 +593,7 @@ pub fn plan(settings: &EncodeSettings, info: &MediaInfo, bitrate: u64) -> Plan {
         FpsMode::Original => src_fps,
         FpsMode::Max60 => decimated_fps(src_fps, 60.0),
         FpsMode::Max30 => half,
+        FpsMode::Auto if src_fps > 60.5 => decimated_fps(src_fps, 60.0),
         FpsMode::Auto => {
             if half >= src_fps - 0.01 {
                 src_fps
@@ -531,8 +727,11 @@ pub fn video_codec_args(
     pass: Pass,
 ) -> Result<Vec<String>, String> {
     let b = s(bitrate);
-    let maxrate = s(bitrate * 3 / 2);
-    let bufsize = s(bitrate * 2);
+    // Single-pass GPU encoders can only spend bits where the cap allows. A tight cap (it
+    // was 1.5x) starves fast action, which is most gaming footage; the size check and
+    // retry after each encode catch the rare overshoot instead.
+    let maxrate = s(bitrate * 3);
+    let bufsize = s(bitrate * 3);
     let mut a: Vec<String> = Vec::new();
 
     if codec.backend == Backend::Software {
@@ -640,6 +839,11 @@ pub fn video_codec_args(
                 ]
                 .map(s),
             );
+            if gpu.tuned {
+                // B-frames used as references: a clear gain at low bitrates. Needs a Turing
+                // (RTX 20 / GTX 16) or newer GPU; older ones fall back to the plain settings.
+                a.extend(["-bf", "3", "-b_ref_mode", "middle"].map(s));
+            }
         }
         Backend::Qsv => {
             let preset = match speed {
@@ -651,11 +855,43 @@ pub fn video_codec_args(
                 ["-c:v", enc, "-preset", preset, "-b:v", &b, "-maxrate", &maxrate, "-bufsize", &bufsize]
                     .map(s),
             );
+            if gpu.tuned {
+                // Extended bitrate control with lookahead spreads bits by content, and adaptive
+                // I/B placement puts keyframes on scene cuts. Some GPUs and low-power modes
+                // lack these; they fall back to the plain settings.
+                a.extend(
+                    ["-extbrc", "1", "-look_ahead_depth", "40", "-adaptive_i", "1", "-adaptive_b", "1"].map(s),
+                );
+            }
         }
         Backend::Vaapi => {
             a.extend(
                 ["-c:v", enc, "-rc_mode", "VBR", "-b:v", &b, "-maxrate", &maxrate, "-bufsize", &bufsize]
                     .map(s),
+            );
+            if gpu.tuned {
+                // Without this FFmpeg sends no quality level and the driver uses its default.
+                // Level 1 is the best-quality setting: on Intel (iHD) the levels run from
+                // 1 (best) to 7 (fastest), and on AMD (Mesa radeonsi) level 1 selects the
+                // quality preset with pre-encode analysis and adaptive quantization. Drivers
+                // without quality levels just ignore it.
+                a.extend(["-compression_level", "1"].map(s));
+            }
+        }
+        Backend::Amf if gpu.tuned => {
+            let preset = match speed {
+                Speed::Faster => "balanced",
+                Speed::Balanced => "quality",
+                Speed::Best => "high_quality",
+            };
+            // hqvbr is AMF's high-quality VBR. Pre-analysis looks ahead to spot scene changes
+            // and spread bits by content, and the motion boost helps in fast scenes.
+            a.extend(
+                [
+                    "-c:v", enc, "-quality", preset, "-rc", "hqvbr", "-b:v", &b, "-maxrate", &maxrate,
+                    "-bufsize", &bufsize, "-preanalysis", "1", "-high_motion_quality_boost_enable", "1",
+                ]
+                .map(s),
             );
         }
         Backend::Amf => {
@@ -669,6 +905,11 @@ pub fn video_codec_args(
         }
         Backend::VideoToolbox => {
             a.extend(["-c:v", enc, "-b:v", &b].map(s));
+            if gpu.tuned {
+                // Don't trade quality for speed (macOS 13+), and adaptive quantization where
+                // the OS supports it. Older macOS versions fall back to the plain settings.
+                a.extend(["-prio_speed", "0", "-spatial_aq", "1"].map(s));
+            }
         }
         Backend::Software => unreachable!(),
     }
@@ -676,6 +917,18 @@ pub fn video_codec_args(
         a.extend(["-profile:v", p].map(s));
     }
     Ok(a)
+}
+
+/// Whether to re-encode a result that fit with lots of room to spare, at a higher bitrate.
+/// Two-pass encodes only do it with Best quality, since a second-pass re-run costs real
+/// time. GPU encodes are fast and aim low (they land less precisely), so they do it unless
+/// the user chose Faster.
+fn fills_leftover_space(codec: Codec, speed: Speed, two_pass: bool) -> bool {
+    if two_pass {
+        speed == Speed::Best
+    } else {
+        codec.is_gpu() && speed != Speed::Faster
+    }
 }
 
 /// Arguments that must come before `-i` for some GPU encoders.
@@ -702,7 +955,7 @@ fn pixel_format(codec: Codec) -> &'static str {
     }
 }
 
-fn tonemap_chain(hdr: &HdrInfo) -> String {
+pub(crate) fn tonemap_chain(hdr: &HdrInfo) -> String {
     format!(
         "zscale=tin={}:pin={}:min={}:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
          tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv",
@@ -720,10 +973,49 @@ pub struct JobSpec {
     pub settings: EncodeSettings,
     pub info: MediaInfo,
     pub target_bytes: u64,
-    pub target_mib: f64,
+    pub edit: Edit,
+    /// Copy the streams without re-encoding when the clip already fits and plays on Discord.
+    pub copy_if_fits: bool,
+    /// Compare the result with the source afterwards and report a quality score.
+    pub measure_quality: bool,
+}
+
+/// The source as the encoder sees it after cutting, cropping and speed changes.
+pub fn out_info_for(info: &MediaInfo, start: f64, end: f64, edit: &Edit) -> MediaInfo {
+    let mut out = info.clone();
+    if let Some(c) = edit.effective_crop(info.width, info.height) {
+        out.width = c.w;
+        out.height = c.h;
+    }
+    out.duration = edit.output_duration(start, end);
+    out.fps = info.fps * edit.speed();
+    out
 }
 
 impl JobSpec {
+    /// Length of the finished video, after cuts and speed changes.
+    pub fn output_duration(&self) -> f64 {
+        self.edit.output_duration(self.start, self.end)
+    }
+
+    /// The source as the encoder sees it after cutting, cropping and speed changes:
+    /// what resolution and frame rate planning works from.
+    pub fn out_info(&self) -> MediaInfo {
+        out_info_for(&self.info, self.start, self.end, &self.edit)
+    }
+
+    fn audio_plan(&self, caps: &Caps) -> Option<AudioPlan> {
+        (audio_tracks_out(&self.settings, &self.info) > 0).then_some(AudioPlan {
+            source_tracks: self.info.audio_tracks,
+            layout: match self.settings.tracks {
+                TrackMode::Mix => AudioLayout::Mix,
+                TrackMode::First => AudioLayout::First,
+                TrackMode::KeepAll => AudioLayout::KeepAll,
+            },
+            normalize: self.settings.normalize && caps.loudnorm,
+        })
+    }
+
     fn tonemap(&self, caps: &Caps) -> Option<&HdrInfo> {
         if self.settings.hdr_to_sdr && caps.tonemap {
             self.info.hdr.as_ref()
@@ -733,17 +1025,39 @@ impl JobSpec {
     }
 }
 
-fn video_filter_chain(spec: &JobSpec, caps: &Caps, plan: &Plan, gpu: Option<&GpuEncoder>) -> String {
+/// Per-frame filters: crop, frame rate, size, denoise, HDR conversion, caption. `pixfmt`
+/// ends the chain (None leaves the format to the caller). `denoise` is off for the
+/// quality check's reference, so a denoised result is judged against the real source.
+fn picture_filters(spec: &JobSpec, caps: &Caps, plan: &Plan, denoise: bool) -> Vec<String> {
     let mut f: Vec<String> = Vec::new();
+    let out = spec.out_info();
+    if let Some(c) = spec.edit.effective_crop(spec.info.width, spec.info.height) {
+        f.push(format!("crop={}:{}:{}:{}", c.w, c.h, c.x, c.y));
+    }
     if plan.fps_filter {
         f.push(format!("fps={:.6}", plan.fps));
     }
-    if (plan.width, plan.height) != (spec.info.width, spec.info.height) {
+    if (plan.width, plan.height) != (out.width, out.height) {
         f.push(format!("scale={}:{}:flags=lanczos", plan.width, plan.height));
+    }
+    if denoise && caps.denoise {
+        if let Some(d) = spec.settings.denoise.filter() {
+            f.push(d.to_string());
+        }
     }
     if let Some(hdr) = spec.tonemap(caps) {
         f.push(tonemap_chain(hdr));
     }
+    if caps.drawtext {
+        if let Some(c) = edit::caption_filter(&spec.edit, plan.width, plan.height, edit::caption_font().as_deref()) {
+            f.push(c);
+        }
+    }
+    f
+}
+
+fn video_filter_chain(spec: &JobSpec, caps: &Caps, plan: &Plan, gpu: Option<&GpuEncoder>) -> String {
+    let mut f = picture_filters(spec, caps, plan, true);
     f.push(format!("format={}", pixel_format(spec.settings.codec)));
     if let Some(tail) = gpu.and_then(gpu_filter_tail) {
         f.push(tail.to_string());
@@ -788,30 +1102,35 @@ fn build_args(
         push("-hwaccel");
         push(h);
     }
+    // -t before -i limits how much of the input is read; as an output option it would
+    // cut slow-motion output short.
     push("-ss");
     push(&format!("{:.3}", spec.start));
+    push("-t");
+    push(&format!("{:.3}", duration));
     push("-i");
     a.push(spec.input.clone().into_os_string());
     let mut push = |v: &str| a.push(OsString::from(v));
-    push("-t");
-    push(&format!("{:.3}", duration));
 
-    let mix = pass != Pass::First
-        && tracks_out > 0
-        && spec.settings.tracks == TrackMode::Mix
-        && spec.info.audio_tracks > 1;
-
-    if mix {
-        let inputs: String = (0..spec.info.audio_tracks).map(|i| format!("[0:a:{i}]")).collect();
+    let audio_plan = if pass == Pass::First { None } else { spec.audio_plan(caps) };
+    if edit::needs_graph(&spec.edit, spec.start, spec.end, audio_plan) {
+        let graph = edit::build_graph(&GraphSpec {
+            input: 0,
+            video_index: vi,
+            start: spec.start,
+            end: spec.end,
+            edit: &spec.edit,
+            vf: vf.clone(),
+            audio: audio_plan,
+        });
         push("-filter_complex");
-        push(&format!(
-            "[0:{vi}]{vf}[v];{inputs}amix=inputs={}:duration=longest:normalize=0[a]",
-            spec.info.audio_tracks
-        ));
+        push(&graph.filter);
         push("-map");
-        push("[v]");
-        push("-map");
-        push("[a]");
+        push(&graph.video);
+        for label in &graph.audio {
+            push("-map");
+            push(label);
+        }
     } else {
         push("-map");
         push(&format!("0:{vi}"));
@@ -828,6 +1147,9 @@ fn build_args(
         }
     }
 
+    for v in caps.passthrough_args() {
+        push(v);
+    }
     for v in video_codec_args(codec, caps.av1, gpu, spec.settings.speed, bitrate, pass)? {
         push(&v);
     }
@@ -872,7 +1194,7 @@ fn build_args(
 // ============================================================
 
 #[derive(Debug)]
-enum RunError {
+pub(crate) enum RunError {
     Cancelled,
     Failed(String),
 }
@@ -914,7 +1236,7 @@ impl CancelToken {
     }
 }
 
-fn run_ffmpeg(
+pub(crate) fn run_ffmpeg(
     tools: &Tools,
     args: &[OsString],
     cwd: &Path,
@@ -924,6 +1246,10 @@ fn run_ffmpeg(
 ) -> Result<(), RunError> {
     if cancel.is_cancelled() {
         return Err(RunError::Cancelled);
+    }
+    if std::env::var_os("CLIPCRAM_DEBUG").is_some() {
+        let shown: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        eprintln!("[clipcram] ffmpeg {}", shown.join(" "));
     }
     let mut child = ffmpeg::command(&tools.ffmpeg)
         .args(args)
@@ -1008,6 +1334,10 @@ pub enum WorkerMsg {
     Done {
         path: PathBuf,
         size: u64,
+        /// SSIM against the source (1.0 is identical), when measured.
+        quality: Option<f64>,
+        /// The streams were copied without re-encoding.
+        copied: bool,
     },
     Failed(String),
     Cancelled,
@@ -1049,25 +1379,41 @@ impl Drop for Partials {
     }
 }
 
-pub fn spawn(tools: Tools, caps: Arc<Caps>, spec: JobSpec, ctx: eframe::egui::Context) -> Worker {
+/// Runs a job on a background thread. `wake` is called after every message (the app
+/// uses it to repaint).
+pub fn spawn(tools: Tools, caps: Arc<Caps>, spec: JobSpec, wake: impl Fn() + Send + 'static) -> Worker {
     let (tx, rx) = mpsc::channel();
     let cancel = CancelToken::default();
     let item_id = spec.item_id;
     let token = cancel.clone();
     thread::spawn(move || {
-        let ctx2 = ctx.clone();
         let send = |msg: WorkerMsg| {
             let _ = tx.send(msg);
-            ctx2.request_repaint();
+            wake();
         };
-        let result = run_job(&tools, &caps, &spec, &token, &send);
-        match result {
-            Ok((path, size)) => send(WorkerMsg::Done { path, size }),
-            Err(RunError::Cancelled) => send(WorkerMsg::Cancelled),
-            Err(RunError::Failed(e)) => send(WorkerMsg::Failed(e)),
-        }
+        send(finish_message(run_job(&tools, &caps, &spec, &token, &send)));
     });
     Worker { item_id, rx, cancel }
+}
+
+/// Runs a job on the calling thread (for the command-line mode).
+pub fn run_blocking(tools: &Tools, caps: &Caps, spec: &JobSpec, send: &dyn Fn(WorkerMsg)) -> WorkerMsg {
+    finish_message(run_job(tools, caps, spec, &CancelToken::default(), send))
+}
+
+fn finish_message(result: Result<Finished, RunError>) -> WorkerMsg {
+    match result {
+        Ok(f) => WorkerMsg::Done { path: f.path, size: f.size, quality: f.quality, copied: f.copied },
+        Err(RunError::Cancelled) => WorkerMsg::Cancelled,
+        Err(RunError::Failed(e)) => WorkerMsg::Failed(e),
+    }
+}
+
+struct Finished {
+    path: PathBuf,
+    size: u64,
+    quality: Option<f64>,
+    copied: bool,
 }
 
 struct ProgressReporter<'a> {
@@ -1112,7 +1458,7 @@ fn run_pass(
     progress: &mut ProgressReporter,
     send: &dyn Fn(WorkerMsg),
 ) -> Result<(), RunError> {
-    let duration = spec.end - spec.start;
+    let duration = spec.output_duration();
     loop {
         let args = build_args(spec, caps, plan, bitrate, pass, hwaccel.as_deref(), output)
             .map_err(RunError::Failed)?;
@@ -1138,20 +1484,57 @@ fn run_job(
     spec: &JobSpec,
     cancel: &CancelToken,
     send: &dyn Fn(WorkerMsg),
-) -> Result<(PathBuf, u64), RunError> {
-    let duration = spec.end - spec.start;
-    if duration <= 0.0 {
+) -> Result<Finished, RunError> {
+    if spec.end - spec.start <= 0.0 {
         return Err(RunError::Failed("End time must be greater than start time.".to_string()));
+    }
+    let duration = spec.output_duration();
+    if duration < edit::MIN_PART {
+        return Err(RunError::Failed("Nothing is left of this clip after the cuts.".to_string()));
     }
     std::fs::create_dir_all(&spec.output_dir).map_err(|e| {
         RunError::Failed(format!("Could not create:\n\n{}\n\n{e}", spec.output_dir.display()))
     })?;
     let tmp = TempDir::new().map_err(|e| RunError::Failed(format!("Could not create a temporary folder: {e}")))?;
+    if spec.edit.has_caption() {
+        std::fs::write(tmp.0.join("caption.txt"), spec.edit.text.trim())
+            .map_err(|e| RunError::Failed(format!("Could not write the caption: {e}")))?;
+    }
+
+    if spec.settings.format != OutputFormat::Mp4 {
+        let (path, size) = crate::animated::run(tools, caps, spec, &tmp.0, cancel, send)?;
+        return Ok(Finished { path, size, quality: None, copied: false });
+    }
+    if let Some((path, size)) = try_stream_copy(tools, caps, spec, &tmp.0, cancel, send)? {
+        return Ok(Finished { path, size, quality: None, copied: true });
+    }
+    let (path, size, plan) = encode_mp4(tools, caps, spec, &tmp, cancel, send)?;
+    let quality = if spec.measure_quality {
+        send(WorkerMsg::Status("Measuring quality against the source".to_string()));
+        measure_ssim(tools, caps, spec, &plan, &path, &tmp.0, cancel)
+    } else {
+        None
+    };
+    Ok(Finished { path, size, quality, copied: false })
+}
+
+/// The two-pass/single-pass encode with size checks and retries.
+fn encode_mp4(
+    tools: &Tools,
+    caps: &Caps,
+    spec: &JobSpec,
+    tmp: &TempDir,
+    cancel: &CancelToken,
+    send: &dyn Fn(WorkerMsg),
+) -> Result<(PathBuf, u64, Plan), RunError> {
+    let duration = spec.output_duration();
+    let out_info = spec.out_info();
 
     let codec = spec.settings.codec;
     let two_pass = is_two_pass(codec, caps);
     let target = spec.target_bytes;
     let mut bitrate = initial_bitrate(target, duration, audio_bps(&spec.settings, &spec.info), safety(two_pass));
+    let mut last_plan: Option<Plan> = None;
     let mut hwaccel = caps.hwaccel.clone();
     let mut stats_for: Option<Plan> = None;
     let mut locked_plan: Option<Plan> = None;
@@ -1166,7 +1549,7 @@ fn run_job(
     };
 
     for attempt in 0..MAX_ATTEMPTS {
-        let plan = locked_plan.unwrap_or_else(|| plan(&spec.settings, &spec.info, bitrate));
+        let plan = locked_plan.unwrap_or_else(|| plan(&spec.settings, &out_info, bitrate));
         progress.started = Instant::now();
         send(WorkerMsg::Status(format!(
             "{} • {}×{} • {} fps • {} kbps",
@@ -1220,14 +1603,14 @@ fn run_job(
         send(WorkerMsg::Status(format!("Output: {:.2} MiB", util::mib(size))));
 
         if size <= target {
+            last_plan = Some(plan);
             if let Some((old, _)) = best.replace((partial.clone(), size)) {
                 let _ = std::fs::remove_file(old);
             }
-            // With "Best quality", use the space that's left: re-run only the second pass
-            // (the first-pass analysis is reused) at a higher bitrate.
+            // Use the space that's left by encoding again at a higher bitrate. Two-pass
+            // encodes re-run only the second pass, reusing the first-pass analysis.
             let room = size < (target as f64 * 0.90) as u64;
-            if spec.settings.speed == Speed::Best
-                && two_pass
+            if fills_leftover_space(codec, spec.settings.speed, two_pass)
                 && room
                 && !fill_tried
                 && attempt + 1 < MAX_ATTEMPTS
@@ -1257,8 +1640,8 @@ fn run_job(
 
     let Some((partial, size)) = best else {
         return Err(RunError::Failed(format!(
-            "Could not get the output below {:.1} MiB after five encoding attempts.",
-            spec.target_mib
+            "Could not get the output below {} after five encoding attempts.",
+            util::format_size(spec.target_bytes as f64)
         )));
     };
 
@@ -1271,7 +1654,205 @@ fn run_job(
         speed: None,
         eta_secs: Some(0.0),
     });
-    Ok((final_path, size))
+    let plan = last_plan.unwrap_or_else(|| plan(&spec.settings, &out_info, bitrate));
+    Ok((final_path, size, plan))
+}
+
+/// Copies the streams as they are when that already gives a file Discord plays inline and
+/// that fits: no quality loss and almost instant. Cuts land on keyframes, so the clip may
+/// start a moment before the chosen start point.
+fn try_stream_copy(
+    tools: &Tools,
+    caps: &Caps,
+    spec: &JobSpec,
+    tmp: &Path,
+    cancel: &CancelToken,
+    send: &dyn Fn(WorkerMsg),
+) -> Result<Option<(PathBuf, u64)>, RunError> {
+    if !copy_eligible(spec, caps) {
+        return Ok(None);
+    }
+    send(WorkerMsg::Status("Already small enough: copying without re-encoding".to_string()));
+    let name = util::sanitize_filename(&spec.output_name);
+    let partial = spec.output_dir.join(format!(".{name}.copy"));
+    let _guard = Partials(vec![partial.clone()]);
+    let tracks_out = audio_tracks_out(&spec.settings, &spec.info);
+    let mut args: Vec<OsString> = Vec::new();
+    for v in ["-hide_banner", "-nostdin", "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-ss"] {
+        args.push(v.into());
+    }
+    args.push(format!("{:.3}", spec.start).into());
+    args.push("-t".into());
+    args.push(format!("{:.3}", spec.end - spec.start).into());
+    args.push("-i".into());
+    args.push(spec.input.clone().into_os_string());
+    args.push("-map".into());
+    args.push(format!("0:{}", spec.info.video_index).into());
+    match (tracks_out, spec.settings.tracks) {
+        (0, _) => args.push("-an".into()),
+        (_, TrackMode::KeepAll) => args.extend(["-map".into(), "0:a".into()]),
+        _ => args.extend(["-map".into(), "0:a:0".into()]),
+    }
+    for v in ["-c", "copy", "-avoid_negative_ts", "make_zero"] {
+        args.push(v.into());
+    }
+    if spec.settings.codec.family == Family::H265 {
+        args.extend(["-tag:v".into(), "hvc1".into()]);
+    }
+    for v in ["-movflags", "+faststart", "-f", "mp4"] {
+        args.push(v.into());
+    }
+    args.push(partial.clone().into_os_string());
+    let mut ignore = |_: f64, _: Option<f64>| {};
+    if run_ffmpeg(tools, &args, tmp, cancel, spec.end - spec.start, &mut ignore).is_err() {
+        if cancel.is_cancelled() {
+            return Err(RunError::Cancelled);
+        }
+        return Ok(None);
+    }
+    let size = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(u64::MAX);
+    if size > spec.target_bytes || size == 0 {
+        send(WorkerMsg::Status("The copy came out too large, so encoding instead".to_string()));
+        return Ok(None);
+    }
+    let final_path = util::unique_output_path(&spec.output_dir, &name);
+    std::fs::rename(&partial, &final_path)
+        .or_else(|_| std::fs::copy(&partial, &final_path).map(|_| ()))
+        .map_err(|e| RunError::Failed(format!("Could not save {}: {e}", final_path.display())))?;
+    Ok(Some((final_path, size)))
+}
+
+/// Whether the source can be copied as-is: nothing to change, a codec and pixel format
+/// Discord plays, AAC audio, and a size that's likely to fit.
+pub fn copy_eligible(spec: &JobSpec, caps: &Caps) -> bool {
+    let s = &spec.settings;
+    let info = &spec.info;
+    let family_matches = matches!(
+        (s.codec.family, info.video_codec.as_str()),
+        (Family::H264, "h264") | (Family::H265, "hevc") | (Family::Av1, "av1")
+    );
+    let pix_ok = s.codec.family == Family::Av1 || matches!(info.pix_fmt.as_str(), "yuv420p" | "yuvj420p");
+    let short = info.width.min(info.height);
+    let size_ok = match s.resolution {
+        ResolutionMode::Short(target) => target >= short,
+        _ => true,
+    };
+    let fps_ok = match s.fps {
+        FpsMode::Max30 => info.fps <= 30.5,
+        FpsMode::Max60 => info.fps <= 60.5,
+        _ => true,
+    };
+    let tracks_out = audio_tracks_out(s, info);
+    let audio_ok = tracks_out == 0
+        || (info.audio_codecs.iter().take(tracks_out).all(|c| c == "aac")
+            && !(s.tracks == TrackMode::Mix && info.audio_tracks > 1));
+    let source_secs = info.duration.max(0.01);
+    let likely_size = info.size_bytes as f64 * (spec.end - spec.start) / source_secs;
+    spec.copy_if_fits
+        && s.format == OutputFormat::Mp4
+        && spec.edit.is_plain(spec.start, spec.end, info.width, info.height)
+        && !s.normalize
+        && s.denoise == Denoise::Off
+        && family_matches
+        && pix_ok
+        && spec.tonemap(caps).is_none()
+        && size_ok
+        && fps_ok
+        && audio_ok
+        && info.size_bytes > 0
+        && likely_size <= spec.target_bytes as f64 * 1.1
+}
+
+/// SSIM of the result against the source, prepared the same way (cut, cropped, scaled)
+/// but not denoised or compressed. 1.0 means identical; above about 0.95 most people can't
+/// tell them apart at normal viewing size.
+fn measure_ssim(
+    tools: &Tools,
+    caps: &Caps,
+    spec: &JobSpec,
+    plan: &Plan,
+    output: &Path,
+    tmp: &Path,
+    cancel: &CancelToken,
+) -> Option<f64> {
+    let mut vf = picture_filters(spec, caps, plan, false);
+    vf.push(format!("scale={}:{}:flags=lanczos", plan.width, plan.height));
+    vf.push("format=yuv420p".to_string());
+    let graph = edit::build_graph(&GraphSpec {
+        input: 1,
+        video_index: spec.info.video_index,
+        start: spec.start,
+        end: spec.end,
+        edit: &spec.edit,
+        vf: vf.join(","),
+        audio: None,
+    });
+    let filter = format!(
+        "{};[0:v]format=yuv420p,setpts=PTS-STARTPTS[o];{}setpts=PTS-STARTPTS[r];[o][r]ssim",
+        graph.filter, graph.video
+    );
+    let mut args: Vec<OsString> = Vec::new();
+    for v in ["-hide_banner", "-nostdin", "-v", "info", "-nostats", "-i"] {
+        args.push(v.into());
+    }
+    args.push(output.as_os_str().to_owned());
+    args.push("-ss".into());
+    args.push(format!("{:.3}", spec.start).into());
+    args.push("-t".into());
+    args.push(format!("{:.3}", spec.end - spec.start).into());
+    args.push("-i".into());
+    args.push(spec.input.clone().into_os_string());
+    for v in ["-filter_complex", &filter, "-an", "-f", "null", NULL_DEVICE] {
+        args.push(v.into());
+    }
+    let text = run_for_log(tools, &args, tmp, cancel)?;
+    parse_ssim(&text)
+}
+
+/// Runs FFmpeg and returns its log, or None if it failed or was cancelled.
+fn run_for_log(tools: &Tools, args: &[OsString], cwd: &Path, cancel: &CancelToken) -> Option<String> {
+    let mut child = ffmpeg::command(&tools.ffmpeg)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stderr = child.stderr.take();
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut s) = stderr {
+            let _ = std::io::Read::read_to_string(&mut s, &mut text);
+        }
+        text
+    });
+    cancel.set_child(child);
+    let status = cancel.wait_child();
+    let text = reader.join().unwrap_or_default();
+    match status {
+        Some(Ok(st)) if st.success() && !cancel.is_cancelled() => Some(text),
+        _ => None,
+    }
+}
+
+/// Reads "All:0.975" from FFmpeg's SSIM summary line.
+pub fn parse_ssim(log: &str) -> Option<f64> {
+    let line = log.lines().rev().find(|l| l.contains("SSIM") && l.contains("All:"))?;
+    let value = line.split("All:").nth(1)?.split_whitespace().next()?;
+    value.parse::<f64>().ok().filter(|v| (0.0..=1.0).contains(v))
+}
+
+/// A plain-words verdict for an SSIM score.
+pub fn quality_label(ssim: f64) -> &'static str {
+    if ssim >= 0.97 {
+        "Excellent"
+    } else if ssim >= 0.94 {
+        "Good"
+    } else if ssim >= 0.90 {
+        "Fair"
+    } else {
+        "Soft"
+    }
 }
 
 pub fn format_fps(fps: f64) -> String {
@@ -1286,6 +1867,31 @@ pub fn format_fps(fps: f64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn settings_survive_a_save_and_load() {
+        let settings = EncodeSettings {
+            codec: Codec::on(Engine { backend: Backend::Nvenc, vendor: Vendor::Nvidia, slot: 0 }, Family::Av1),
+            resolution: ResolutionMode::Short(720),
+            fps: FpsMode::Max30,
+            speed: Speed::Best,
+            audio: AudioMode::Off,
+            tracks: TrackMode::KeepAll,
+            hdr_to_sdr: false,
+            format: OutputFormat::Webp,
+            denoise: Denoise::Light,
+            normalize: true,
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(serde_json::from_str::<EncodeSettings>(&json).unwrap(), settings);
+    }
+
+    #[test]
+    fn missing_settings_fields_fall_back_to_defaults() {
+        // A settings file written before a field existed keeps what it does have.
+        let loaded: EncodeSettings = serde_json::from_str(r#"{"speed":"Best"}"#).unwrap();
+        assert_eq!(loaded, EncodeSettings { speed: Speed::Best, ..EncodeSettings::default() });
+    }
+
     fn info(w: u32, h: u32, fps: f64) -> MediaInfo {
         MediaInfo {
             duration: 60.0,
@@ -1296,6 +1902,7 @@ mod tests {
             audio_tracks: 1,
             hdr: None,
             video_codec: "h264".into(),
+            ..MediaInfo::default()
         }
     }
 
@@ -1379,7 +1986,9 @@ mod tests {
                 settings,
                 info: info.clone(),
                 target_bytes: (target_mib * 1024.0 * 1024.0) as u64,
-                target_mib,
+                edit: Edit::default(),
+                copy_if_fits: false,
+                measure_quality: false,
             };
             let started = Instant::now();
             let attempts = std::cell::Cell::new(0u32);
@@ -1394,7 +2003,7 @@ mod tests {
             println!("== {}", codec.label());
             let result = run_job(&tools, &caps, &spec, &CancelToken::default(), &send);
             match result {
-                Ok((path, size)) => {
+                Ok(Finished { path, size, .. }) => {
                     let out = ffmpeg::probe(&tools, &path).expect("probe output");
                     println!(
                         "  OK {:.3} MiB of {target_mib} MiB ({:.0}%) -> {}x{} {:.2} fps {:.2}s, {} audio, {:.1}s wall",
@@ -1439,6 +2048,81 @@ mod tests {
         assert!(!joined.contains("-pass "));
         let a = video_codec_args(Codec::AV1, Some(Av1Encoder::Svt), None, Speed::Balanced, 1_000_000, Pass::Single).unwrap();
         assert!(!a.join(" ").contains("-pass"));
+    }
+
+    fn amd(backend: Backend, tuned: bool) -> GpuEncoder {
+        let (encoder, device) = match backend {
+            Backend::Vaapi => ("hevc_vaapi", Some("/dev/dri/renderD128".to_string())),
+            _ => ("hevc_amf", None),
+        };
+        GpuEncoder {
+            codec: Codec::on(Engine { backend, vendor: Vendor::Amd, slot: 0 }, Family::H265),
+            encoder: encoder.to_string(),
+            device,
+            name: "AMD Radeon RX 7800 XT".to_string(),
+            tuned,
+        }
+    }
+
+    fn gpu_args(gpu: &GpuEncoder, speed: Speed) -> String {
+        video_codec_args(gpu.codec, None, Some(gpu), speed, 2_000_000, Pass::Single).unwrap().join(" ")
+    }
+
+    #[test]
+    fn amd_quality_settings_and_fallback() {
+        let tuned = gpu_args(&amd(Backend::Amf, true), Speed::Best);
+        assert!(tuned.contains("-quality high_quality -rc hqvbr"));
+        assert!(tuned.contains("-preanalysis 1"));
+        // The fallback is exactly the old, widely supported setup.
+        let plain = gpu_args(&amd(Backend::Amf, false), Speed::Best);
+        assert!(plain.contains("-quality quality -rc vbr_peak"));
+        assert!(!plain.contains("preanalysis"));
+
+        assert!(gpu_args(&amd(Backend::Vaapi, true), Speed::Balanced).contains("-compression_level 1"));
+        assert!(!gpu_args(&amd(Backend::Vaapi, false), Speed::Balanced).contains("compression_level"));
+    }
+
+    fn vendor_gpu(backend: Backend, family: Family, encoder: &str, tuned: bool) -> GpuEncoder {
+        GpuEncoder {
+            codec: Codec::on(Engine { backend, vendor: backend.native_vendor(), slot: 0 }, family),
+            encoder: encoder.to_string(),
+            device: None,
+            name: "GPU".to_string(),
+            tuned,
+        }
+    }
+
+    #[test]
+    fn every_vendor_has_quality_settings_with_a_plain_fallback() {
+        let cases = [
+            (Backend::Nvenc, "hevc_nvenc", "-b_ref_mode middle"),
+            (Backend::Qsv, "hevc_qsv", "-extbrc 1 -look_ahead_depth 40"),
+            (Backend::VideoToolbox, "hevc_videotoolbox", "-prio_speed 0"),
+        ];
+        for (backend, encoder, extra) in cases {
+            let tuned = gpu_args(&vendor_gpu(backend, Family::H265, encoder, true), Speed::Balanced);
+            let plain = gpu_args(&vendor_gpu(backend, Family::H265, encoder, false), Speed::Balanced);
+            assert!(tuned.contains(extra), "{backend:?}: {tuned}");
+            assert!(!plain.contains(extra), "{backend:?}: {plain}");
+        }
+    }
+
+    #[test]
+    fn gpu_rate_cap_leaves_room_for_action() {
+        let a = gpu_args(&amd(Backend::Vaapi, true), Speed::Balanced);
+        assert!(a.contains("-maxrate 6000000 -bufsize 6000000"));
+    }
+
+    #[test]
+    fn which_encodes_fill_leftover_space() {
+        let gpu = Codec::on(Engine { backend: Backend::Vaapi, vendor: Vendor::Amd, slot: 0 }, Family::H265);
+        assert!(fills_leftover_space(gpu, Speed::Balanced, false));
+        assert!(fills_leftover_space(gpu, Speed::Best, false));
+        assert!(!fills_leftover_space(gpu, Speed::Faster, false));
+        // CPU encodes keep their old behavior.
+        assert!(fills_leftover_space(Codec::H265, Speed::Best, true));
+        assert!(!fills_leftover_space(Codec::H265, Speed::Balanced, true));
+        assert!(!fills_leftover_space(Codec::AV1, Speed::Best, false));
     }
 
     #[test]

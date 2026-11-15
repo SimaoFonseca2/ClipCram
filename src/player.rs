@@ -211,6 +211,8 @@ pub struct MediaSource {
     pub video_index: usize,
     pub audio_tracks: usize,
     pub mix_audio: bool,
+    /// Per-track volume applied when mixing, so the preview sounds like the encode.
+    pub track_volumes: Vec<f32>,
     /// Preview frame size (small, to keep decoding cheap).
     pub width: usize,
     pub height: usize,
@@ -363,6 +365,10 @@ impl Player {
         self.position
     }
 
+    pub fn duration(&self) -> f64 {
+        self.media.as_ref().map(|m| m.duration).unwrap_or(0.0)
+    }
+
     pub fn texture(&self) -> Option<&TextureHandle> {
         self.texture.as_ref()
     }
@@ -500,11 +506,14 @@ impl Player {
                     .arg(&media.path)
                     .arg("-vn");
                 if media.mix_audio && media.audio_tracks > 1 {
-                    let inputs: String = (0..media.audio_tracks).map(|i| format!("[0:a:{i}]")).collect();
+                    let volumes: String = (0..media.audio_tracks)
+                        .map(|i| format!("[0:a:{i}]volume={:.3}[pv{i}];", media.track_volumes.get(i).copied().unwrap_or(1.0)))
+                        .collect();
+                    let inputs: String = (0..media.audio_tracks).map(|i| format!("[pv{i}]")).collect();
                     cmd.args([
                         "-filter_complex",
                         &format!(
-                            "{inputs}amix=inputs={}:duration=longest:normalize=0[a]",
+                            "{volumes}{inputs}amix=inputs={}:duration=longest:normalize=0[a]",
                             media.audio_tracks
                         ),
                         "-map",

@@ -568,11 +568,13 @@ dependencies = [
 name = "clipcram"
 version = "1.0.0"
 dependencies = [
+ "arboard",
  "cpal",
  "dirs",
  "eframe",
  "open",
  "rfd",
+ "ron",
  "serde",
  "serde_json",
 ]

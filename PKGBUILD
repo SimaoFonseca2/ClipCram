@@ -49,6 +49,9 @@ makedepends=('cargo' 'git')
 optdepends=(
   'xdg-desktop-portal: native file dialogs'
   'zenity: file dialogs when no desktop portal is running'
+  'curl: Discord webhook and update check'
+  'libnotify: notifications when encoding finishes'
+  'ttf-dejavu: captions, if FFmpeg has no other font to use'
 )
 # Cargo.toml already enables LTO and stripping for release builds.
 options=('!lto' '!debug')

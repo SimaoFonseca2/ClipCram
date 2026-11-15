@@ -2,6 +2,21 @@
 
 use std::path::{Path, PathBuf};
 
+/// A size for people: "9.50 MiB", or "640 KiB" below 1 MiB.
+pub fn format_size(bytes: f64) -> String {
+    if bytes < 1024.0 * 1024.0 {
+        format!("{:.0} KiB", bytes / 1024.0)
+    } else {
+        format!("{:.2} MiB", bytes / 1024.0 / 1024.0)
+    }
+}
+
+/// A number without trailing zeros: 15 -> "15", 12.5 -> "12.5".
+pub fn trim_float(v: f64) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// `m:ss` or `h:mm:ss`, whole seconds.
 pub fn format_time(seconds: f64) -> String {
     let s = if seconds.is_finite() && seconds > 0.0 {
@@ -143,7 +158,7 @@ pub fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -166,6 +181,12 @@ mod tests {
         assert_eq!(parse_time("0:01:23"), Some(83.0));
         assert_eq!(parse_time("12 sec"), Some(12.0));
         assert_eq!(parse_time("abc"), None);
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(format_size(655_360.0), "640 KiB");
+        assert_eq!(format_size(9.5 * 1024.0 * 1024.0), "9.50 MiB");
     }
 
     #[test]

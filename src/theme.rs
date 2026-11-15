@@ -32,16 +32,16 @@ const fn hex(rgb: u32) -> Color32 {
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            base: hex(0x1B1E24),
-            surface: hex(0x22262E),
-            input: hex(0x15171C),
-            button: hex(0x2C313B),
-            button_hover: hex(0x353B47),
-            button_active: hex(0x3E4553),
-            stroke: hex(0x313743),
-            stroke_strong: hex(0x495163),
-            text: hex(0xE4E7EC),
-            weak: hex(0x9AA1AD),
+            base: hex(0x14161B),
+            surface: hex(0x1C1F26),
+            input: hex(0x111318),
+            button: hex(0x262A33),
+            button_hover: hex(0x2F3440),
+            button_active: hex(0x3A404E),
+            stroke: hex(0x2A2F39),
+            stroke_strong: hex(0x434A59),
+            text: hex(0xE6E8EC),
+            weak: hex(0x8E95A2),
             accent: hex(0xF0A83A),
             accent_ink: hex(0xF3B556),
             on_accent: hex(0x1B1E24),
@@ -51,7 +51,7 @@ pub fn palette(dark: bool) -> Palette {
         }
     } else {
         Palette {
-            base: hex(0xECEEF1),
+            base: hex(0xEEF0F3),
             surface: hex(0xFFFFFF),
             input: hex(0xF5F6F8),
             button: hex(0xE3E6EA),
@@ -78,12 +78,14 @@ pub fn current(ctx: &egui::Context) -> Palette {
 fn visuals(dark: bool) -> Visuals {
     let p = palette(dark);
     let mut v = if dark { Visuals::dark() } else { Visuals::light() };
-    let radius = CornerRadius::same(6);
+    let radius = CornerRadius::same(4);
 
     v.panel_fill = p.base;
     v.window_fill = p.surface;
     v.window_stroke = Stroke::new(1.0, p.stroke);
-    v.window_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(14);
+    v.window_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if dark { 110 } else { 40 }) };
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(if dark { 90 } else { 30 }) };
     v.menu_corner_radius = CornerRadius::same(8);
     v.extreme_bg_color = p.input;
     v.text_edit_bg_color = Some(p.input);
@@ -133,9 +135,10 @@ fn visuals(dark: bool) -> Visuals {
     v
 }
 
-pub fn apply(ctx: &egui::Context) {
+pub fn apply(ctx: &egui::Context, pref: crate::config::ThemePref) {
     ctx.set_visuals_of(Theme::Dark, visuals(true));
     ctx.set_visuals_of(Theme::Light, visuals(false));
+    set_preference(ctx, pref);
 
     for theme in [Theme::Dark, Theme::Light] {
         ctx.style_mut_of(theme, |style| {
@@ -147,10 +150,20 @@ pub fn apply(ctx: &egui::Context) {
                 (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
             ]
             .into();
-            style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-            style.spacing.button_padding = egui::vec2(10.0, 5.0);
-            style.spacing.interact_size.y = 26.0;
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            style.spacing.button_padding = egui::vec2(12.0, 6.0);
+            style.spacing.interact_size.y = 28.0;
             style.spacing.combo_width = 220.0;
+            style.spacing.slider_width = 160.0;
         });
     }
+}
+
+pub fn set_preference(ctx: &egui::Context, pref: crate::config::ThemePref) {
+    use crate::config::ThemePref;
+    ctx.set_theme(match pref {
+        ThemePref::System => egui::ThemePreference::System,
+        ThemePref::Dark => egui::ThemePreference::Dark,
+        ThemePref::Light => egui::ThemePreference::Light,
+    });
 }
